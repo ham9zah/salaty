@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+      - name: Validate Python and shell scripts
+        run: |
+          python -m py_compile salaty.py
+          bash -n install.sh run.sh uninstall.sh
+      - name: Offscreen UI smoke test
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python - <<'PY'
+          import salaty
+          from PyQt6.QtWidgets import QApplication
+          app = QApplication([])
+          salaty._load_fonts()
+          salaty.MainWindow._fetch_all = lambda self: None
+          salaty.MainWindow._timers = lambda self: None
+          window = salaty.MainWindow()
+          assert window.windowTitle() == "صلاتي"
+          window._allow_quit = True
+          window.close()
+          PY
