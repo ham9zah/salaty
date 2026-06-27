@@ -12,6 +12,7 @@ ICONS_ROOT="$DATA_HOME/icons/hicolor"
 
 rm -rf "$INSTALL_DIR"
 rm -f "$HOME/.local/bin/salaty" "$APPLICATIONS_DIR/salaty.desktop"
+rm -f "$HOME/.config/autostart/salaty.desktop"
 for size in 32 48 64 128 256 512; do
     rm -f "$ICONS_ROOT/${size}x${size}/apps/salaty.png"
 done

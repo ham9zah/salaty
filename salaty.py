@@ -12,8 +12,9 @@ from PyQt6.QtWidgets import (
     QStackedWidget, QButtonGroup, QSystemTrayIcon, QMenu,
 )
 from PyQt6.QtCore import (
-    Qt, QTimer, QThread, pyqtSignal, QRectF, QPointF, QProcess,
+    Qt, QTimer, QThread, pyqtSignal, QRectF, QPointF, QProcess, QLockFile,
 )
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtGui import (QFont, QFontDatabase, QCursor, QColor,
                           QPainter, QPen, QPainterPath, QPixmap, QIcon,
                           QAction)
@@ -1592,15 +1593,71 @@ class MainWindow(QMainWindow):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    app = QApplication(sys.argv)
+    start_in_background = '--background' in sys.argv
+    qt_args = [arg for arg in sys.argv if arg != '--background']
+    app = QApplication(qt_args)
     app.setApplicationName('Salaty')
     app.setDesktopFileName('salaty')
+
+    # Keep exactly one Salaty process per user. A later manual launch asks the
+    # running process to show its window instead of starting another copy.
+    server_name = f'salaty-{os.getuid()}'
+    existing = QLocalSocket()
+    existing.connectToServer(server_name)
+    if existing.waitForConnected(500):
+        existing.write(b'background' if start_in_background else b'show')
+        existing.waitForBytesWritten(500)
+        return
+
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    instance_lock = QLockFile(os.path.join(CONFIG_DIR, 'instance.lock'))
+    if not instance_lock.tryLock(500):
+        # The first copy may still be starting and not listening yet.
+        existing.abort()
+        existing.connectToServer(server_name)
+        if existing.waitForConnected(1000):
+            existing.write(b'background' if start_in_background else b'show')
+            existing.waitForBytesWritten(500)
+        return
+
+    server = QLocalServer(app)
+    if not server.listen(server_name):
+        # A crashed process can leave a stale local socket behind.
+        QLocalServer.removeServer(server_name)
+        if not server.listen(server_name):
+            print('تعذّر إنشاء قفل النسخة الواحدة لصلاتي.', file=sys.stderr)
+
     if os.path.exists(APP_ICON):
         app.setWindowIcon(QIcon(APP_ICON))
     _load_fonts()
     app.setFont(F(11))
     win = MainWindow()
-    win.show()
+    # Autostart stays out of the way when a tray is available. On desktops
+    # without tray support, keep the window visible so the app is not hidden
+    # with no way to reopen it.
+    if not start_in_background or win._tray is None:
+        win.show()
+
+    def handle_new_instance():
+        connection = server.nextPendingConnection()
+        if connection is None:
+            return
+
+        def handle_request():
+            request = bytes(connection.readAll())
+            if request == b'show':
+                win._show_from_tray()
+            connection.disconnectFromServer()
+            connection.deleteLater()
+
+        if connection.bytesAvailable():
+            handle_request()
+        else:
+            connection.readyRead.connect(handle_request)
+
+    server.newConnection.connect(handle_new_instance)
+    if server.hasPendingConnections():
+        handle_new_instance()
     sys.exit(app.exec())
 
 if __name__ == '__main__':

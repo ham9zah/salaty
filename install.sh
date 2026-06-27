@@ -12,6 +12,7 @@ fi
 INSTALL_DIR="$DATA_HOME/salaty"
 BIN_DIR="$HOME/.local/bin"
 APPLICATIONS_DIR="$DATA_HOME/applications"
+AUTOSTART_DIR="$HOME/.config/autostart"
 ICONS_ROOT="$DATA_HOME/icons/hicolor"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
@@ -59,8 +60,8 @@ else
     touch "$INSTALL_DIR/.use-venv"
 fi
 
-info "إضافة أمر التشغيل وقائمة التطبيقات"
-mkdir -p "$BIN_DIR" "$APPLICATIONS_DIR"
+info "إضافة أمر التشغيل وقائمة التطبيقات والتشغيل التلقائي"
+mkdir -p "$BIN_DIR" "$APPLICATIONS_DIR" "$AUTOSTART_DIR"
 cat > "$BIN_DIR/salaty" <<EOF
 #!/usr/bin/env bash
 exec "$INSTALL_DIR/run.sh" "\$@"
@@ -91,6 +92,21 @@ StartupNotify=true
 StartupWMClass=Salaty
 EOF
 
+cat > "$AUTOSTART_DIR/salaty.desktop" <<EOF
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=صلاتي
+Name[en]=Salaty
+Comment=تشغيل صلاتي في الخلفية عند تسجيل الدخول
+Comment[en]=Start Salaty in the background when signing in
+Exec=$BIN_DIR/salaty --background
+Icon=salaty
+Terminal=false
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
+EOF
+
 update-desktop-database "$APPLICATIONS_DIR" >/dev/null 2>&1 || true
 gtk-update-icon-cache -f -t "$ICONS_ROOT" >/dev/null 2>&1 || true
 
@@ -104,6 +120,7 @@ fi
 printf '\n'
 ok "اكتمل تثبيت صلاتي بنجاح."
 printf 'ابحث عن «صلاتي» في قائمة البرامج، أو شغّله بالأمر: salaty\n'
+printf 'سيبدأ صلاتي تلقائياً في الخلفية عند تسجيل الدخول القادم.\n'
 if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
     warn "أضف $BIN_DIR إلى PATH لتشغيل الأمر salaty من الطرفية."
 fi
