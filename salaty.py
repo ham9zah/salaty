@@ -106,6 +106,8 @@ class Hijri:
     MN = ['محرم','صفر','ربيع الأول','ربيع الثاني','جمادى الأولى',
           'جمادى الثانية','رجب','شعبان','رمضان','شوال','ذو القعدة','ذو الحجة']
     DN = ['الأحد','الإثنين','الثلاثاء','الأربعاء','الخميس','الجمعة','السبت']
+    GM = ['يناير','فبراير','مارس','أبريل','مايو','يونيو',
+          'يوليو','أغسطس','سبتمبر','أكتوبر','نوفمبر','ديسمبر']
 
     @classmethod
     def fmt(cls, date=None):
@@ -120,6 +122,11 @@ class Hijri:
         hm = (24*L)//709; hd = L - (709*hm)//24; hy = 30*N + J - 30
         dow = d.isoweekday() % 7
         return f"{cls.DN[dow]}،  {hd}  {cls.MN[hm-1]}  {hy} هـ"
+
+    @classmethod
+    def gregorian_fmt(cls, date=None):
+        d = date or datetime.date.today()
+        return f'{d.day} {cls.GM[d.month-1]} {d.year} م'
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  TRANSLATIONS
@@ -836,6 +843,8 @@ class MainWindow(QMainWindow):
         self._allow_quit = False
         self._tray_hint_shown = False
         self._sound_process = None
+        self._syncing = False
+        self._sync_pending = False
         self._setup()
         self._build()
         self._setup_tray()
@@ -860,7 +869,7 @@ class MainWindow(QMainWindow):
                 );
             }}
         """)
-        self.setMinimumSize(600, 540)
+        self.setMinimumSize(600, 560)
         self.resize(720, 610)
         self.setMaximumWidth(900)
         scr = QApplication.primaryScreen().availableGeometry()
@@ -871,6 +880,7 @@ class MainWindow(QMainWindow):
 
     def _build(self):
         cw = QWidget(); cw.setObjectName('central')
+        cw.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setCentralWidget(cw)
         root = QVBoxLayout(cw); root.setContentsMargins(0,0,0,0); root.setSpacing(0)
         root.addWidget(self._topbar())
@@ -882,6 +892,7 @@ class MainWindow(QMainWindow):
         bl.addWidget(self._cols_row())
         bl.addWidget(self._footer())
         root.addWidget(body)
+        cw.setFocus()
 
     # ── TOP BAR ───────────────────────────────────────────────────────────────
 
@@ -908,13 +919,14 @@ class MainWindow(QMainWindow):
             color:{GOLD_L}; background:rgba(213,169,78,0.12);
             border:1px solid rgba(213,169,78,0.35); border-radius:18px;
         """)
-        self._dot = QLabel('●'); self._dot.setFont(F(9))
-        self._dot.setStyleSheet(f'color:{DIM};')
-        r_btn = self._btn('↻', 'تحديث'); r_btn.clicked.connect(self._fetch_all)
-        s_btn = self._btn('⚙', 'إعدادات')
+        self._refresh_btn = self._btn('تحديث', 'تحديث مواقيت الصلاة (Ctrl+R)', 66)
+        self._refresh_btn.setShortcut('Ctrl+R')
+        self._refresh_btn.clicked.connect(self._fetch_all)
+        s_btn = self._btn('الإعدادات', 'فتح الإعدادات (Ctrl+,)', 78)
+        s_btn.setShortcut('Ctrl+,')
         s_btn.clicked.connect(lambda: self._settings(s_btn))
         lay.addWidget(mark); lay.addWidget(brand); lay.addStretch()
-        for w in (self._dot, r_btn, s_btn): lay.addWidget(w)
+        for w in (self._refresh_btn, s_btn): lay.addWidget(w)
         return bar
 
     # ── HEADER (city + date) ──────────────────────────────────────────────────
@@ -932,7 +944,7 @@ class MainWindow(QMainWindow):
             'stop:0 rgba(213,169,78,0.32),stop:1 transparent);')
         center = QWidget(); center.setStyleSheet('background:transparent;')
         center_lay = QVBoxLayout(center)
-        center_lay.setContentsMargins(0,0,0,0); center_lay.setSpacing(4)
+        center_lay.setContentsMargins(0,0,0,0); center_lay.setSpacing(3)
         self._city = QLabel('جاري التحديد…')
         self._city.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._city.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
@@ -946,7 +958,14 @@ class MainWindow(QMainWindow):
             color:{GOLD_L}; background:rgba(213,169,78,0.08);
             border-radius:9px; padding:2px 10px;
         """)
-        center_lay.addWidget(self._city); center_lay.addWidget(self._hijri)
+        self._gregorian = QLabel(Hijri.gregorian_fmt())
+        self._gregorian.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._gregorian.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        self._gregorian.setFont(F(8))
+        self._gregorian.setStyleSheet(f'color:{MUTED};')
+        center_lay.addWidget(self._city)
+        center_lay.addWidget(self._hijri)
+        center_lay.addWidget(self._gregorian)
         lay.addWidget(left_line, 1); lay.addWidget(center); lay.addWidget(right_line, 1)
         return w
 
@@ -1040,7 +1059,7 @@ class MainWindow(QMainWindow):
         nrl.addWidget(self._c_name)
 
         # prayer time label
-        self._c_time = QLabel('—')
+        self._c_time = QLabel('موعد الأذان  •  —')
         self._c_time.setObjectName('cTime')
         self._c_time.setFont(F(10))
         self._c_time.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
@@ -1151,24 +1170,32 @@ class MainWindow(QMainWindow):
 
     def _footer(self):
         w = QWidget(); w.setStyleSheet('background:transparent;')
-        lay = QHBoxLayout(w); lay.setContentsMargins(2,0,2,0); lay.setSpacing(0)
+        lay = QHBoxLayout(w); lay.setContentsMargins(2,0,2,0); lay.setSpacing(8)
         self._mth_lbl = QLabel(METHODS.get(self._cfg.get('method',3),''))
         self._mth_lbl.setFont(F(8)); self._mth_lbl.setStyleSheet(f'color:{DIM};')
         self._mth_lbl.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        self._net = QLabel('…'); self._net.setFont(F(9))
-        self._net.setStyleSheet(f'color:{DIM};')
-        self._net.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        self._net = QLabel('●  جارٍ التحميل'); self._net.setFont(F(8, semi=True))
+        self._net.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._net.setStyleSheet(f"""
+            color:{DIM}; background:rgba(255,255,255,0.04);
+            border:1px solid rgba(255,255,255,0.07);
+            border-radius:10px; padding:3px 9px;
+        """)
+        self._net.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         lay.addWidget(self._mth_lbl); lay.addStretch(); lay.addWidget(self._net)
         return w
 
-    def _btn(self, icon, tip=''):
-        b = QPushButton(icon); b.setFixedSize(34,34); b.setToolTip(tip)
+    def _btn(self, text, tip='', width=34):
+        b = QPushButton(text); b.setFixedSize(width,34); b.setToolTip(tip)
+        b.setFont(F(9, semi=True))
         b.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         b.setStyleSheet(f"""
             QPushButton{{background:rgba(255,255,255,0.07);color:{MUTED};
-                border:1px solid {BORDER};border-radius:17px;font-size:15px;}}
+                border:1px solid {BORDER};border-radius:17px;padding:0 10px;}}
             QPushButton:hover{{background:rgba(255,255,255,0.14);color:{WHITE};}}
             QPushButton:pressed{{background:rgba(213,169,78,0.24);}}
+            QPushButton:focus{{border:1px solid {GOLD};color:{WHITE};}}
+            QPushButton:disabled{{color:{DIM};background:rgba(255,255,255,0.03);}}
         """)
         return b
 
@@ -1349,8 +1376,12 @@ class MainWindow(QMainWindow):
     # ── NETWORK ───────────────────────────────────────────────────────────────
 
     def _fetch_all(self):
-        self._net.setText('يتصل…'); self._net.setStyleSheet(f'color:{DIM};')
-        self._dot.setStyleSheet(f'color:{DIM};')
+        if self._syncing:
+            return
+        self._syncing = True
+        self._refresh_btn.setEnabled(False)
+        self._refresh_btn.setText('يحدّث…')
+        self._set_sync_status('loading')
         if self._cfg.get('manual_loc') and self._cfg.get('lat'):
             self._fetch_times(self._cfg['lat'], self._cfg['lng'])
         else:
@@ -1372,7 +1403,9 @@ class MainWindow(QMainWindow):
 
     def _on_loc_fail(self, _):
         if self._cfg.get('lat'): self._fetch_times(self._cfg['lat'], self._cfg['lng'])
-        else: self._net.setText('تعذّر تحديد الموقع')
+        else:
+            self._sync_finished()
+            self._set_sync_status('error', 'تعذّر تحديد الموقع')
 
     def _fetch_times(self, lat, lng):
         tf = TimeFetcher(lat, lng, self._cfg.get('method',3), self._cfg.get('school',0))
@@ -1384,9 +1417,8 @@ class MainWindow(QMainWindow):
                        for k in ('Fajr','Sunrise','Dhuhr','Asr','Maghrib','Isha')
                        if k in raw}
         self._online = True
-        self._dot.setStyleSheet(f'color:{GREEN};')
-        self._dot.setToolTip('متصل')
-        self._net.setText('محدَّث  ✓'); self._net.setStyleSheet(f'color:{GREEN};')
+        self._sync_finished()
+        self._set_sync_status('online')
         disp = (self._cfg.get('city_display') or self._cfg.get('city_ar')
                 or self._cfg.get('city_en',''))
         if disp: self._city.setText(disp); self.setWindowTitle(f'صلاتي  —  {self._cfg.get("city_ar") or disp}')
@@ -1394,11 +1426,39 @@ class MainWindow(QMainWindow):
 
     def _on_fail(self, _):
         self._online = False
+        self._sync_finished()
         if self._times:
-            self._dot.setStyleSheet(f'color:{AMBER};')
-            self._net.setText('من الذاكرة المؤقتة'); self._net.setStyleSheet(f'color:{AMBER};')
+            self._set_sync_status('cached')
         else:
-            self._net.setText('لا يوجد اتصال'); self._net.setStyleSheet(f'color:{DIM};')
+            self._set_sync_status('error', 'لا يوجد اتصال')
+
+    def _sync_finished(self):
+        self._syncing = False
+        self._refresh_btn.setEnabled(True)
+        self._refresh_btn.setText('تحديث')
+        if self._sync_pending:
+            self._sync_pending = False
+            QTimer.singleShot(0, self._fetch_all)
+
+    def _set_sync_status(self, state, text=''):
+        styles = {
+            'loading': (DIM, 'rgba(255,255,255,0.04)', 'جارٍ التحديث'),
+            'online': (GREEN_L, 'rgba(47,175,125,0.10)', 'محدّث الآن'),
+            'cached': (GOLD_L, 'rgba(213,169,78,0.10)', 'بيانات محفوظة'),
+            'error': (AMBER, 'rgba(214,155,69,0.10)', text or 'تعذّر التحديث'),
+        }
+        color, background, label = styles.get(state, styles['loading'])
+        self._net.setText(f'●  {label}')
+        self._net.setToolTip({
+            'online': 'تم جلب المواقيت بنجاح',
+            'cached': 'تُعرض آخر مواقيت محفوظة لهذا اليوم',
+            'loading': 'يجري الاتصال بخدمة المواقيت',
+            'error': label,
+        }.get(state, ''))
+        self._net.setStyleSheet(f"""
+            color:{color}; background:{background};
+            border:1px solid {color}; border-radius:10px; padding:3px 9px;
+        """)
 
     # ── CACHE ─────────────────────────────────────────────────────────────────
 
@@ -1426,8 +1486,7 @@ class MainWindow(QMainWindow):
             if disp:
                 self._city.setText(disp)
                 self.setWindowTitle(f'صلاتي  —  {c.get("city_ar") or disp}')
-            self._dot.setStyleSheet(f'color:{AMBER};')
-            self._net.setText('من الذاكرة المؤقتة'); self._net.setStyleSheet(f'color:{AMBER};')
+            self._set_sync_status('cached')
             self._refresh()
         except Exception: pass
 
@@ -1435,6 +1494,7 @@ class MainWindow(QMainWindow):
 
     def _refresh(self):
         self._hijri.setText(Hijri.fmt())
+        self._gregorian.setText(Hijri.gregorian_fmt())
         self._sunrise.setText(self._times.get('Sunrise', '--:--'))
         for nm, col in self._cols.items():
             if nm in self._times: col.set_time(self._times[nm])
@@ -1513,7 +1573,8 @@ class MainWindow(QMainWindow):
             """)
             self._c_name.setText(PRAYER_AR.get(self._iq_nm,''))
             self._c_name.setStyleSheet(f'color:{GREEN_L};{tr}')
-            self._c_time.setText(self._times.get(self._iq_nm,''))
+            self._c_time.setText(
+                f'موعد الأذان  •  {self._times.get(self._iq_nm, "—")}')
             self._c_time.setStyleSheet(f'color:rgba(98,212,167,0.68);{tr}')
             self._c_cd_lbl.setText('يتبقى على الإقامة')
             self._c_cd_lbl.setStyleSheet(f"""
@@ -1533,7 +1594,8 @@ class MainWindow(QMainWindow):
             self._c_name.setText(PRAYER_AR.get(self._next_nm, '—'))
             self._c_name.setStyleSheet(f'color:{WHITE};{tr}')
             t = self._next_dt
-            self._c_time.setText(f'{t.hour:02d}:{t.minute:02d}' if t else '—')
+            prayer_time = f'{t.hour:02d}:{t.minute:02d}' if t else '—'
+            self._c_time.setText(f'موعد الأذان  •  {prayer_time}')
             self._c_time.setStyleSheet(f'color:rgba(240,190,74,0.70);{tr}')
             self._c_cd_lbl.setText('يتبقى')
             self._c_cd_lbl.setStyleSheet(f"""
@@ -1541,6 +1603,7 @@ class MainWindow(QMainWindow):
                 border-radius:8px; padding:1px 7px; {tr}
             """)
             self._cd.setStyleSheet(f'color:{GOLD_L};{tr}')
+        self._paint_countdown()
         self._refresh_tray()
 
     # ── TIMERS ────────────────────────────────────────────────────────────────
@@ -1552,12 +1615,19 @@ class MainWindow(QMainWindow):
 
     def _tick(self):
         self._check_prayer_notification()
+        if self._paint_countdown() == 0:
+            self._update()
+
+    def _paint_countdown(self):
         target = self._iq_end if self._in_iq else self._next_dt
-        if not target: return
+        if not target: return None
         rem = max(0, int((target - datetime.datetime.now()).total_seconds()))
-        if rem == 0: self._update(); return
+        if rem == 0:
+            self._cd.setText('00:00:00')
+            return 0
         h=rem//3600; m=(rem%3600)//60; s=rem%60
         self._cd.setText(f'{h:02d}:{m:02d}:{s:02d}')
+        return rem
 
     def _day_chk(self):
         t = datetime.date.today()
@@ -1586,7 +1656,10 @@ class MainWindow(QMainWindow):
                 self._sound_process.kill()
             self._mth_lbl.setText(METHODS.get(self._cfg.get('method',3),''))
             if os.path.exists(CACHE_FILE): os.remove(CACHE_FILE)
-            self._fetch_all()
+            if self._syncing:
+                self._sync_pending = True
+            else:
+                self._fetch_all()
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  MAIN
