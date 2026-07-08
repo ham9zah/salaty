@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-import sys, datetime, json, os, math, urllib.request, wave, struct
+import sys, datetime, json, os, math, urllib.request, urllib.parse, wave, struct
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFrame, QDialog, QComboBox,
@@ -29,6 +29,18 @@ CONFIG_DIR  = os.path.expanduser('~/.config/salaty/')
 CONFIG_FILE = os.path.join(CONFIG_DIR, 'settings.json')
 CACHE_FILE  = os.path.join(CONFIG_DIR, 'cache.json')
 IQAMA_DEF   = {'Fajr': 20, 'Dhuhr': 15, 'Asr': 15, 'Maghrib': 5, 'Isha': 15}
+PRAYER_KEYS = ('Fajr', 'Sunrise', 'Dhuhr', 'Asr', 'Maghrib', 'Isha')
+CACHE_MONTHS = 12
+
+def clean_timings(raw):
+    return {
+        k: raw[k].split(' ')[0].split('(')[0].strip()
+        for k in PRAYER_KEYS if k in raw
+    }
+
+def add_months(date, count):
+    month_index = date.year * 12 + date.month - 1 + count
+    return month_index // 12, month_index % 12 + 1
 
 def load_cfg():
     d = {}
@@ -205,7 +217,41 @@ class TimeFetcher(QThread):
                    f'&method={self.method}&school={self.school}')
             req = urllib.request.Request(url, headers={'User-Agent':'Salaty/3'})
             with urllib.request.urlopen(req, timeout=14) as r:
-                self.ok.emit(json.loads(r.read())['data']['timings'])
+                self.ok.emit(clean_timings(json.loads(r.read())['data']['timings']))
+        except Exception as e:
+            self.fail.emit(str(e))
+
+class CalendarFetcher(QThread):
+    ok   = pyqtSignal(dict)
+    fail = pyqtSignal(str)
+    def __init__(self, lat, lng, method=3, school=0, months=CACHE_MONTHS):
+        super().__init__()
+        self.lat, self.lng = lat, lng
+        self.method, self.school = method, school
+        self.months = months
+    def run(self):
+        try:
+            today = datetime.date.today().replace(day=1)
+            days = {}
+            params = urllib.parse.urlencode({
+                'latitude': self.lat, 'longitude': self.lng,
+                'method': self.method, 'school': self.school,
+            })
+            for offset in range(self.months):
+                year, month = add_months(today, offset)
+                url = f'https://api.aladhan.com/v1/calendar/{year}/{month}?{params}'
+                req = urllib.request.Request(url, headers={'User-Agent':'Salaty/3'})
+                with urllib.request.urlopen(req, timeout=14) as r:
+                    payload = json.loads(r.read())
+                for item in payload.get('data', []):
+                    greg = item.get('date', {}).get('gregorian', {}).get('date')
+                    if not greg:
+                        continue
+                    day = datetime.datetime.strptime(greg, '%d-%m-%Y').date()
+                    times = clean_timings(item.get('timings', {}))
+                    if times:
+                        days[day.isoformat()] = times
+            self.ok.emit(days)
         except Exception as e:
             self.fail.emit(str(e))
 
@@ -845,6 +891,9 @@ class MainWindow(QMainWindow):
         self._sound_process = None
         self._syncing = False
         self._sync_pending = False
+        self._calendar_fetching = False
+        self._calendar_pending = False
+        self._calendar_params = {}
         self._setup()
         self._build()
         self._setup_tray()
@@ -1413,9 +1462,7 @@ class MainWindow(QMainWindow):
         tf.finished.connect(tf.deleteLater); self._tf = tf; tf.start()
 
     def _on_times(self, raw):
-        self._times = {k: raw[k].split(' ')[0].split('(')[0].strip()
-                       for k in ('Fajr','Sunrise','Dhuhr','Asr','Maghrib','Isha')
-                       if k in raw}
+        self._times = clean_timings(raw)
         self._online = True
         self._sync_finished()
         self._set_sync_status('online')
@@ -1423,6 +1470,7 @@ class MainWindow(QMainWindow):
                 or self._cfg.get('city_en',''))
         if disp: self._city.setText(disp); self.setWindowTitle(f'صلاتي  —  {self._cfg.get("city_ar") or disp}')
         self._save_cache(); self._refresh()
+        self._ensure_calendar_cache()
 
     def _on_fail(self, _):
         self._online = False
@@ -1439,6 +1487,36 @@ class MainWindow(QMainWindow):
         if self._sync_pending:
             self._sync_pending = False
             QTimer.singleShot(0, self._fetch_all)
+
+    def _ensure_calendar_cache(self):
+        if self._calendar_fetching:
+            self._calendar_pending = True
+            return
+        if not self._should_fetch_calendar_cache():
+            return
+        lat, lng = self._cfg.get('lat'), self._cfg.get('lng')
+        if lat is None or lng is None:
+            return
+        cf = CalendarFetcher(
+            lat, lng, self._cfg.get('method',3), self._cfg.get('school',0))
+        cf.ok.connect(self._on_calendar_cache)
+        cf.fail.connect(lambda _: None)
+        cf.finished.connect(cf.deleteLater)
+        cf.finished.connect(self._calendar_finished)
+        self._calendar_fetching = True
+        self._calendar_params = self._cache_params()
+        self._cf = cf
+        cf.start()
+
+    def _on_calendar_cache(self, days):
+        if days and self._calendar_params == self._cache_params():
+            self._save_cache_days(days)
+
+    def _calendar_finished(self):
+        self._calendar_fetching = False
+        if self._calendar_pending:
+            self._calendar_pending = False
+            QTimer.singleShot(0, self._ensure_calendar_cache)
 
     def _set_sync_status(self, state, text=''):
         styles = {
@@ -1462,33 +1540,107 @@ class MainWindow(QMainWindow):
 
     # ── CACHE ─────────────────────────────────────────────────────────────────
 
-    def _save_cache(self):
-        save_cfg(self._cfg)
+    def _cache_params(self):
+        return {
+            'lat': self._cfg.get('lat'), 'lng': self._cfg.get('lng'),
+            'method': self._cfg.get('method', 3),
+            'school': self._cfg.get('school', 0),
+        }
+
+    def _read_cache(self):
+        if not os.path.exists(CACHE_FILE):
+            return {}
+        try:
+            with open(CACHE_FILE, encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _cache_matches(self, cache):
+        params = cache.get('params') or {}
+        try:
+            same_place = (
+                abs(float(params.get('lat')) - float(self._cfg.get('lat'))) < 0.01
+                and abs(float(params.get('lng')) - float(self._cfg.get('lng'))) < 0.01
+            )
+        except Exception:
+            same_place = not self._cfg.get('lat') and not self._cfg.get('lng')
+        return (
+            same_place
+            and params.get('method') == self._cfg.get('method', 3)
+            and params.get('school') == self._cfg.get('school', 0)
+        )
+
+    def _write_cache(self, days):
         os.makedirs(CONFIG_DIR, exist_ok=True)
-        with open(CACHE_FILE,'w',encoding='utf-8') as f:
-            json.dump({'date':datetime.date.today().isoformat(),
-                       'city_ar':self._cfg.get('city_ar',''),
-                       'city_en':self._cfg.get('city_en',''),
-                       'city_display':self._cfg.get('city_display',''),
-                       'lat':self._cfg.get('lat'),'lng':self._cfg.get('lng'),
-                       'times':self._times}, f, ensure_ascii=False, indent=2)
+        with open(CACHE_FILE, 'w', encoding='utf-8') as f:
+            json.dump({
+                'version': 2,
+                'updated': datetime.datetime.now().isoformat(timespec='seconds'),
+                'params': self._cache_params(),
+                'city_ar': self._cfg.get('city_ar',''),
+                'city_en': self._cfg.get('city_en',''),
+                'city_display': self._cfg.get('city_display',''),
+                'days': days,
+            }, f, ensure_ascii=False, indent=2)
+
+    def _save_cache_days(self, new_days):
+        save_cfg(self._cfg)
+        cache = self._read_cache()
+        days = cache.get('days', {}) if self._cache_matches(cache) else {}
+        days.update(new_days)
+        self._write_cache(days)
+
+    def _save_cache(self):
+        self._save_cache_days({datetime.date.today().isoformat(): self._times})
 
     def _load_cache(self):
-        if not os.path.exists(CACHE_FILE): return
+        return self._load_cached_day(datetime.date.today())
+
+    def _load_cached_day(self, day):
+        cache = self._read_cache()
+        if not cache:
+            return False
         try:
-            with open(CACHE_FILE,encoding='utf-8') as f: c=json.load(f)
-            if c.get('date') != datetime.date.today().isoformat(): return
-            if not c.get('times'): return
-            self._times = c['times']
+            params = cache.get('params') or {}
+            for k in ('lat','lng'):
+                if params.get(k) is not None:
+                    self._cfg[k] = params[k]
             for k in ('lat','lng','city_ar','city_en','city_display'):
-                if c.get(k): self._cfg[k] = c[k]
-            disp = c.get('city_display') or c.get('city_ar') or c.get('city_en','')
+                if cache.get(k):
+                    self._cfg[k] = cache[k]
+            if cache.get('version') == 2:
+                if not self._cache_matches(cache):
+                    return False
+                self._times = cache.get('days', {}).get(day.isoformat(), {})
+            else:
+                if cache.get('date') != day.isoformat():
+                    return False
+                self._times = cache.get('times', {})
+            if not self._times:
+                return False
+            disp = (cache.get('city_display') or cache.get('city_ar')
+                    or cache.get('city_en',''))
             if disp:
                 self._city.setText(disp)
-                self.setWindowTitle(f'صلاتي  —  {c.get("city_ar") or disp}')
+                self.setWindowTitle(f'صلاتي  —  {cache.get("city_ar") or disp}')
             self._set_sync_status('cached')
             self._refresh()
-        except Exception: pass
+            return True
+        except Exception:
+            return False
+
+    def _should_fetch_calendar_cache(self):
+        cache = self._read_cache()
+        if cache.get('version') != 2 or not self._cache_matches(cache):
+            return True
+        days = cache.get('days', {})
+        today = datetime.date.today()
+        checks = (0, 30, 180, 364)
+        return any(
+            (today + datetime.timedelta(days=offset)).isoformat() not in days
+            for offset in checks
+        )
 
     # ── REFRESH ───────────────────────────────────────────────────────────────
 
@@ -1631,7 +1783,10 @@ class MainWindow(QMainWindow):
 
     def _day_chk(self):
         t = datetime.date.today()
-        if t != self._last_day: self._last_day = t; self._fetch_all()
+        if t != self._last_day:
+            self._last_day = t
+            self._load_cached_day(t)
+            self._fetch_all()
 
     # ── SETTINGS ──────────────────────────────────────────────────────────────
 
@@ -1649,13 +1804,17 @@ class MainWindow(QMainWindow):
                         - dlg.height() - 8)
             dlg.move(x, y)
         if dlg.exec() == QDialog.DialogCode.Accepted:
+            old_cfg = self._cfg
             self._cfg = dlg.result()
             save_cfg(self._cfg)
             if (self._cfg.get('notifications_muted', False)
                     and self._sound_process is not None):
                 self._sound_process.kill()
             self._mth_lbl.setText(METHODS.get(self._cfg.get('method',3),''))
-            if os.path.exists(CACHE_FILE): os.remove(CACHE_FILE)
+            cache_keys = ('lat', 'lng', 'method', 'school', 'manual_loc')
+            cache_changed = any(old_cfg.get(k) != self._cfg.get(k) for k in cache_keys)
+            if cache_changed and os.path.exists(CACHE_FILE):
+                os.remove(CACHE_FILE)
             if self._syncing:
                 self._sync_pending = True
             else:
